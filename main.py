@@ -62,6 +62,81 @@ async def ping_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("ping_sheet error")
         await update.message.reply_text(f"❌ Error conectando a Sheets:\n{e}")
 
+def _ws(sh, name: str):
+    return sh.worksheet(name)
+
+def _headers(ws):
+    return [h.strip() for h in ws.row_values(1)]
+
+def _col(headers, name: str) -> int:
+    return headers.index(name) + 1  # 1-based
+
+def _find_row_by_value(ws, col_idx: int, value: str):
+    vals = ws.col_values(col_idx)
+    for i, v in enumerate(vals[1:], start=2):
+        if str(v).strip() == str(value).strip():
+            return i
+    return None
+
+async def crear_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /crear_tablero
+    - Ejecutar dentro del grupo destino.
+    - Crea el mensaje del tablero y guarda el message_id en CONFIG_ALERTAS.
+    """
+    try:
+        chat = update.effective_chat
+        if not chat:
+            return
+        chat_id = str(chat.id)
+
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+        ws_cfg = _ws(sh, TAB_CONFIG)
+
+        headers = _headers(ws_cfg)
+        for required in ("CHAT_ID_ALERTAS", "TABLERO_MESSAGE_ID", "ULTIMA_ACTUALIZACION"):
+            if required not in headers:
+                await update.message.reply_text(f"❌ CONFIG_ALERTAS no tiene columna: {required}")
+                return
+
+        # 1) Crear mensaje tablero
+        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tablero_text = (
+            "📌 TABLERO SCTR\n"
+            f"Actualizado: {now_s}\n\n"
+            "✅ Conexión lista.\n"
+            "Siguiente: cargaremos alertas y botones."
+        )
+
+        msg = await chat.send_message(tablero_text)
+
+        # 2) Guardar / upsert en CONFIG_ALERTAS por CHAT_ID_ALERTAS
+        c_chat = _col(headers, "CHAT_ID_ALERTAS")
+        c_mid = _col(headers, "TABLERO_MESSAGE_ID")
+        c_upd = _col(headers, "ULTIMA_ACTUALIZACION")
+
+        row = _find_row_by_value(ws_cfg, c_chat, chat_id)
+        if row is None:
+            new_row = [""] * len(headers)
+            new_row[c_chat - 1] = chat_id
+            new_row[c_mid - 1] = str(msg.message_id)
+            new_row[c_upd - 1] = now_s
+            ws_cfg.append_row(new_row, value_input_option="USER_ENTERED")
+        else:
+            ws_cfg.update_cell(row, c_mid, str(msg.message_id))
+            ws_cfg.update_cell(row, c_upd, now_s)
+
+        await update.message.reply_text(
+            "✅ Tablero creado y registrado en CONFIG_ALERTAS.\n"
+            f"CHAT_ID_ALERTAS={chat_id}\n"
+            f"TABLERO_MESSAGE_ID={msg.message_id}\n\n"
+            "📌 Ahora ANCLA (PIN) ese mensaje en el grupo."
+        )
+
+    except Exception as e:
+        logging.exception("crear_tablero error")
+        await update.message.reply_text(f"❌ Error creando tablero:\n{e}")
 
 def main():
     if not BOT_TOKEN:
@@ -70,6 +145,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping_sheet", ping_sheet))
+    app.add_handler(CommandHandler("crear_tablero", crear_tablero))
 
     print("Bot corriendo...")
     app.run_polling(close_loop=False)
@@ -77,3 +153,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
