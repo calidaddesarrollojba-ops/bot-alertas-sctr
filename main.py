@@ -26,6 +26,7 @@ GOOGLE_CREDS_JSON_TEXT = os.getenv("GOOGLE_CREDS_JSON_TEXT", "").strip()
 TAB_ALERTAS = "ALERTAS_SCTR"
 TAB_ACK = "ACK_ALERTAS"
 TAB_CONFIG = "CONFIG_ALERTAS"
+TAB_RESP = "RESPONSABLES_EMPRESA"
 
 
 # ======================
@@ -390,6 +391,36 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sh = client.open_by_key(SHEET_ID)
         ws_ack = sh.worksheet(TAB_ACK)
         ws_alert = sh.worksheet(TAB_ALERTAS)
+        ws_resp = sh.worksheet(TAB_RESP)
+
+        # 1) Encontrar la empresa de este ID_ALERTA
+        rows_alert = ws_alert.get_all_records()
+        empresa = None
+        for r in rows_alert:
+            if str(r.get("ID_ALERTA", "")).strip() == id_alerta:
+                empresa = str(r.get("EMPRESA", "")).strip()
+                break
+
+        if not empresa:
+            await query.answer("⚠️ No se encontró la empresa de esta alerta.", show_alert=True)
+            return
+
+        # 2) Validar que el usuario esté autorizado en RESPONSABLES_EMPRESA (ACTIVO=1)
+        rows_resp = ws_resp.get_all_records()
+        autorizado = False
+        for rr in rows_resp:
+            emp = str(rr.get("EMPRESA", "")).strip().lower()
+            uid = str(rr.get("USER_ID", "")).strip()
+            activo = str(rr.get("ACTIVO", "1")).strip()
+
+            if emp == empresa.lower() and uid == str(user.id) and activo == "1":
+                autorizado = True
+                break
+
+        if not autorizado:
+            await query.answer(f"⛔ No estás autorizado para responder por {empresa}.", show_alert=True)
+            return
+        
 
         # 1) Guardar ACK_ALERTAS por headers
         headers_ack = [h.strip() for h in ws_ack.row_values(1)]
@@ -459,3 +490,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
