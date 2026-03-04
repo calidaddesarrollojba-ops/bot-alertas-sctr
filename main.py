@@ -6,7 +6,7 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +19,6 @@ TAB_ALERTAS = "ALERTAS_SCTR"
 TAB_ACK = "ACK_ALERTAS"
 TAB_CONFIG = "CONFIG_ALERTAS"
 
-
 def get_gspread_client() -> gspread.Client:
     if not GOOGLE_CREDS_JSON_TEXT:
         raise RuntimeError("Falta GOOGLE_CREDS_JSON_TEXT")
@@ -28,10 +27,8 @@ def get_gspread_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot de Alertas SCTR activo.")
-
 
 async def ping_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -207,7 +204,6 @@ def build_tablero_text_from_alertas(rows: list) -> str:
     parts.append("\n⚠️ Este tablero se actualiza con /actualizar_tablero.")
     return "\n".join(parts).strip()
 
-
 async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /actualizar_tablero
@@ -266,6 +262,58 @@ async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.exception("actualizar_tablero error")
         await update.message.reply_text(f"❌ Error actualizando tablero:\n{e}")
 
+async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not context.args:
+        await update.message.reply_text("Uso: /detalle NOMBRE_EMPRESA")
+        return
+
+    empresa = " ".join(context.args).strip().lower()
+
+    client = get_gspread_client()
+    sh = client.open_by_key(SHEET_ID)
+    ws = sh.worksheet(TAB_ALERTAS)
+
+    rows = ws.get_all_records()
+
+    alerta = None
+    for r in rows:
+        emp = str(r.get("EMPRESA", "")).lower()
+        if empresa in emp:
+            alerta = r
+            break
+
+    if not alerta:
+        await update.message.reply_text("Empresa no encontrada en ALERTAS_SCTR.")
+        return
+
+    empresa_nombre = alerta.get("EMPRESA")
+    fecha_fin = alerta.get("FECHA_FIN")
+    dias = alerta.get("DIAS_RESTANTES")
+    estado = alerta.get("ESTADO", "SIN_CONFIRMAR")
+    id_alerta = alerta.get("ID_ALERTA")
+
+    text = (
+        f"📋 DETALLE SCTR\n\n"
+        f"Empresa: {empresa_nombre}\n"
+        f"Vence: {fecha_fin}\n"
+        f"Días restantes: {dias}\n"
+        f"Estado: {estado}"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Recibido", callback_data=f"ACK|{id_alerta}|RECIBIDO"),
+            InlineKeyboardButton("📝 En proceso", callback_data=f"ACK|{id_alerta}|EN_PROCESO"),
+            InlineKeyboardButton("✔ Renovado", callback_data=f"ACK|{id_alerta}|RENOVADO"),
+        ]
+    ]
+
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta BOT_TOKEN en variables de entorno.")
@@ -275,6 +323,7 @@ def main():
     app.add_handler(CommandHandler("ping_sheet", ping_sheet))
     app.add_handler(CommandHandler("crear_tablero", crear_tablero))
     app.add_handler(CommandHandler("actualizar_tablero", actualizar_tablero))
+    app.add_handler(CommandHandler("detalle", detalle))
 
     print("Bot corriendo...")
     app.run_polling(close_loop=False)
@@ -282,5 +331,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
