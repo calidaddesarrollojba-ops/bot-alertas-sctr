@@ -240,7 +240,7 @@ def build_tablero_text_from_alertas(rows: list) -> str:
 
 
 # ======================
-# TABLERO: REFRESH (FUNC REUTILIZABLE)
+# TABLERO: REFRESH (EDITAR MENSAJE)
 # ======================
 async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -280,11 +280,50 @@ async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
+# TABLERO: BUMP (REPLY CORTO AL TABLERO)
+# ======================
+async def bump_tablero(context: ContextTypes.DEFAULT_TYPE, reason: str = ""):
+    """
+    Manda un mensaje corto como REPLY al tablero (bump).
+    No duplica el tablero; lo vuelve visible al final del chat.
+    """
+    client = get_gspread_client()
+    sh = client.open_by_key(SHEET_ID)
+    ws_cfg = sh.worksheet(TAB_CONFIG)
+
+    cfg_rows = ws_cfg.get_all_records()
+    cfg = None
+    for r in cfg_rows:
+        if str(r.get("CHAT_ID_ALERTAS", "")).strip():
+            cfg = r
+            break
+    if not cfg:
+        return
+
+    chat_id = str(cfg.get("CHAT_ID_ALERTAS", "")).strip()
+    msg_id = str(cfg.get("TABLERO_MESSAGE_ID", "")).strip()
+    if not chat_id or not msg_id:
+        return
+
+    text = "🔄 Tablero actualizado"
+    if reason:
+        text = f"🔄 {reason}"
+
+    await context.bot.send_message(
+        chat_id=int(chat_id),
+        text=text,
+        reply_to_message_id=int(msg_id),
+        disable_web_page_preview=True
+    )
+
+
+# ======================
 # TABLERO: ACTUALIZAR (COMANDO)
 # ======================
 async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await refresh_tablero(context)
+        await bump_tablero(context, "Tablero actualizado (manual)")
 
         # update ULTIMA_ACTUALIZACION
         client = get_gspread_client()
@@ -368,7 +407,7 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# CALLBACK BOTONES (ACK + AUTORIZACIÓN + REFRESH TABLERO)
+# CALLBACK BOTONES (ACK + AUTORIZACIÓN + REFRESH + BUMP)
 # ======================
 async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -391,7 +430,7 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        # Seguridad: el botón SOLO debe funcionar si proviene del mensaje detalle correcto
+        # Seguridad: botón solo funciona desde el mensaje detalle correcto
         msg_text = (query.message.text or "")
         if f"ID_ALERTA: {id_alerta}" not in msg_text:
             await query.answer("⚠️ Este botón no corresponde a este detalle.", show_alert=True)
@@ -410,12 +449,11 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if str(r.get("ID_ALERTA", "")).strip() == id_alerta:
                 empresa = str(r.get("EMPRESA", "")).strip()
                 break
-
         if not empresa:
             await query.answer("⚠️ No se encontró la empresa de esta alerta.", show_alert=True)
             return
 
-        # 2) Validar autorización por RESPONSABLES_EMPRESA (ACTIVO=1)
+        # 2) Validar autorización (RESPONSABLES_EMPRESA, ACTIVO=1)
         rows_resp = ws_resp.get_all_records()
         autorizado = False
         for rr in rows_resp:
@@ -425,15 +463,13 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if emp == empresa.lower() and uid == str(user.id) and activo == "1":
                 autorizado = True
                 break
-
         if not autorizado:
             await query.answer(f"⛔ No estás autorizado para responder por {empresa}.", show_alert=True)
             return
 
-        # 3) Guardar ACK_ALERTAS por headers (sin asumir columnas extra)
+        # 3) Guardar ACK_ALERTAS por headers
         headers_ack = [h.strip() for h in ws_ack.row_values(1)]
         row_ack = {h: "" for h in headers_ack}
-        # columnas típicas
         if "ID_ALERTA" in headers_ack:
             row_ack["ID_ALERTA"] = id_alerta
         if "EMPRESA" in headers_ack:
@@ -451,7 +487,7 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ws_ack.append_row([row_ack.get(h, "") for h in headers_ack], value_input_option="USER_ENTERED")
 
-        # 4) Actualizar ALERTAS_SCTR: ESTADO, CONFIRMADO_POR, CONFIRMADO_AT, UPDATED_AT
+        # 4) Actualizar ALERTAS_SCTR (ESTADO + confirmación)
         headers_alert = [h.strip() for h in ws_alert.row_values(1)]
         for must in ("ID_ALERTA", "ESTADO"):
             if must not in headers_alert:
@@ -485,8 +521,9 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Hora: {now_s}"
         )
 
-        # 6) Actualizar tablero automáticamente
+        # 6) Actualizar tablero + bump
         await refresh_tablero(context)
+        await bump_tablero(context, f"{empresa}: {accion}")
 
     except Exception as e:
         logging.exception("on_ack_callback error")
@@ -500,10 +537,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # JOB RECORDATORIOS
 # ======================
 def _parse_dt(s: str) -> float:
-    """
-    Convierte 'YYYY-MM-DD HH:MM:SS' a timestamp (segundos).
-    Si falla, retorna 0.
-    """
     try:
         return datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S").timestamp()
     except Exception:
@@ -513,7 +546,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Se ejecuta cada 60 min.
     Envía recordatorio SOLO si hay CRITICO + SIN_CONFIRMAR.
-    Anti-spam: respeta LAST_REMINDER_AT (>= 60 min) a nivel de alerta.
     Requiere columnas en ALERTAS_SCTR:
       LAST_REMINDER_AT, REMINDER_COUNT
     """
@@ -545,20 +577,17 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             estado = str(r.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
             if nivel == "CRITICO" and estado == "SIN_CONFIRMAR":
                 criticos.append(r)
-
         if not criticos:
             return
 
         headers = _headers(ws_alert)
         if "LAST_REMINDER_AT" not in headers or "REMINDER_COUNT" not in headers or "ID_ALERTA" not in headers:
-            # No hay columnas anti-spam aún
             return
 
         now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         now_ts = datetime.now().timestamp()
         one_hour = 60 * 60
 
-        # enviar solo si al menos 1 crítico no fue recordado en la última hora
         need_send = False
         for r in criticos:
             last = str(r.get("LAST_REMINDER_AT", "")).strip()
@@ -585,7 +614,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True
         )
 
-        # Actualizar LAST_REMINDER_AT y REMINDER_COUNT para todos los críticos (para que no repita)
         col_id = headers.index("ID_ALERTA") + 1
         col_last = headers.index("LAST_REMINDER_AT") + 1
         col_cnt = headers.index("REMINDER_COUNT") + 1
@@ -610,6 +638,8 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
             ws_alert.update_cell(row_i, col_last, now_s)
             ws_alert.update_cell(row_i, col_cnt, str(cur + 1))
+
+        # bump extra opcional (ya hay reply, pero lo dejamos apagado para evitar spam)
 
     except Exception:
         logging.exception("reminder_job error")
