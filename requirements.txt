@@ -1,4 +1,5 @@
-python-telegram-bot==21.6
+python-telegram-bot[job-queue]==21.6
 gspread==6.1.2
 google-auth==2.33.0
+
 pytz==2024.1
