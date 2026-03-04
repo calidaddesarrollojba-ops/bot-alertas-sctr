@@ -282,7 +282,7 @@ async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         rows = ws_alert.get_all_records()
         text = build_tablero_text_from_alertas(rows)
-
+        
         await context.bot.edit_message_text(
             chat_id=int(chat_id),
             message_id=int(msg_id),
@@ -303,6 +303,41 @@ async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.exception("actualizar_tablero error")
         await update.message.reply_text(f"❌ Error actualizando tablero:\n{e}")
 
+async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE):
+    client = get_gspread_client()
+    sh = client.open_by_key(SHEET_ID)
+
+    ws_cfg = sh.worksheet(TAB_CONFIG)
+    ws_alert = sh.worksheet(TAB_ALERTAS)
+
+    cfg_rows = ws_cfg.get_all_records()
+
+    if not cfg_rows:
+        return
+
+    cfg = None
+    for r in cfg_rows:
+        if str(r.get("CHAT_ID_ALERTAS", "")).strip():
+            cfg = r
+            break
+
+    if not cfg:
+        return
+
+    chat_id = str(cfg.get("CHAT_ID_ALERTAS", "")).strip()
+    msg_id = str(cfg.get("TABLERO_MESSAGE_ID", "")).strip()
+
+    if not chat_id or not msg_id:
+        return
+
+    rows = ws_alert.get_all_records()
+    text = build_tablero_text_from_alertas(rows)
+
+    await context.bot.edit_message_text(
+        chat_id=int(chat_id),
+        message_id=int(msg_id),
+        text=text
+    )
 
 # ======================
 # DETALLE POR EMPRESA + BOTONES
@@ -461,6 +496,9 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Hora: {now_s}"
         )
 
+        # actualizar tablero automáticamente
+        await refresh_tablero(context)
+    
     except Exception as e:
         logging.exception("on_ack_callback error")
         await query.edit_message_text(f"❌ Error procesando botón:\n{e}")
@@ -490,4 +528,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
