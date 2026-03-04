@@ -7,10 +7,18 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
 logging.basicConfig(level=logging.INFO)
 
+# ======================
+# ENV / CONSTANTES
+# ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 GOOGLE_CREDS_JSON_TEXT = os.getenv("GOOGLE_CREDS_JSON_TEXT", "").strip()
@@ -19,6 +27,10 @@ TAB_ALERTAS = "ALERTAS_SCTR"
 TAB_ACK = "ACK_ALERTAS"
 TAB_CONFIG = "CONFIG_ALERTAS"
 
+
+# ======================
+# GOOGLE SHEETS
+# ======================
 def get_gspread_client() -> gspread.Client:
     if not GOOGLE_CREDS_JSON_TEXT:
         raise RuntimeError("Falta GOOGLE_CREDS_JSON_TEXT")
@@ -27,8 +39,39 @@ def get_gspread_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
+
+# ======================
+# HELPERS SHEET
+# ======================
+def _ws(sh, name: str):
+    return sh.worksheet(name)
+
+def _headers(ws):
+    return [h.strip() for h in ws.row_values(1)]
+
+def _col(headers, name: str) -> int:
+    return headers.index(name) + 1  # 1-based
+
+def _find_row_by_value(ws, col_idx: int, value: str):
+    vals = ws.col_values(col_idx)
+    for i, v in enumerate(vals[1:], start=2):
+        if str(v).strip() == str(value).strip():
+            return i
+    return None
+
+
+# ======================
+# COMANDOS BÁSICOS
+# ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot de Alertas SCTR activo.")
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    name = f"@{u.username}" if u.username else (u.full_name or "Usuario")
+    await update.message.reply_text(f"👤 {name}\n🆔 USER_ID: {u.id}")
+
 
 async def ping_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -59,22 +102,10 @@ async def ping_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("ping_sheet error")
         await update.message.reply_text(f"❌ Error conectando a Sheets:\n{e}")
 
-def _ws(sh, name: str):
-    return sh.worksheet(name)
 
-def _headers(ws):
-    return [h.strip() for h in ws.row_values(1)]
-
-def _col(headers, name: str) -> int:
-    return headers.index(name) + 1  # 1-based
-
-def _find_row_by_value(ws, col_idx: int, value: str):
-    vals = ws.col_values(col_idx)
-    for i, v in enumerate(vals[1:], start=2):
-        if str(v).strip() == str(value).strip():
-            return i
-    return None
-
+# ======================
+# TABLERO: CREAR
+# ======================
 async def crear_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /crear_tablero
@@ -135,6 +166,10 @@ async def crear_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("crear_tablero error")
         await update.message.reply_text(f"❌ Error creando tablero:\n{e}")
 
+
+# ======================
+# TABLERO: CONSTRUIR TEXTO
+# ======================
 def build_tablero_text_from_alertas(rows: list) -> str:
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -147,6 +182,7 @@ def build_tablero_text_from_alertas(rows: list) -> str:
 
     # ordenar por nivel y días
     order = {"CRITICO": 0, "ALERTA": 1, "PROXIMO": 2}
+
     def key_fn(r):
         nivel = str(r.get("NIVEL", "")).strip().upper()
         dias_s = str(r.get("DIAS_RESTANTES", "999")).strip()
@@ -204,6 +240,10 @@ def build_tablero_text_from_alertas(rows: list) -> str:
     parts.append("\n⚠️ Este tablero se actualiza con /actualizar_tablero.")
     return "\n".join(parts).strip()
 
+
+# ======================
+# TABLERO: ACTUALIZAR (EDITAR MENSAJE)
+# ======================
 async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /actualizar_tablero
@@ -262,13 +302,16 @@ async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.exception("actualizar_tablero error")
         await update.message.reply_text(f"❌ Error actualizando tablero:\n{e}")
 
-async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+# ======================
+# DETALLE POR EMPRESA + BOTONES
+# ======================
+async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Uso: /detalle NOMBRE_EMPRESA")
         return
 
-    empresa = " ".join(context.args).strip().lower()
+    empresa_q = " ".join(context.args).strip().lower()
 
     client = get_gspread_client()
     sh = client.open_by_key(SHEET_ID)
@@ -278,8 +321,8 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     alerta = None
     for r in rows:
-        emp = str(r.get("EMPRESA", "")).lower()
-        if empresa in emp:
+        emp = str(r.get("EMPRESA", "")).strip().lower()
+        if emp and (empresa_q in emp):
             alerta = r
             break
 
@@ -287,18 +330,19 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Empresa no encontrada en ALERTAS_SCTR.")
         return
 
-    empresa_nombre = alerta.get("EMPRESA")
-    fecha_fin = alerta.get("FECHA_FIN")
-    dias = alerta.get("DIAS_RESTANTES")
-    estado = alerta.get("ESTADO", "SIN_CONFIRMAR")
-    id_alerta = alerta.get("ID_ALERTA")
+    empresa_nombre = str(alerta.get("EMPRESA", "")).strip()
+    fecha_fin = str(alerta.get("FECHA_FIN", "")).strip()
+    dias = str(alerta.get("DIAS_RESTANTES", "")).strip()
+    estado = str(alerta.get("ESTADO", "SIN_CONFIRMAR")).strip()
+    id_alerta = str(alerta.get("ID_ALERTA", "")).strip()
 
     text = (
         f"📋 DETALLE SCTR\n\n"
         f"Empresa: {empresa_nombre}\n"
         f"Vence: {fecha_fin}\n"
         f"Días restantes: {dias}\n"
-        f"Estado: {estado}"
+        f"Estado: {estado}\n"
+        f"ID_ALERTA: {id_alerta}"
     )
 
     keyboard = [
@@ -309,21 +353,105 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ]
 
-    await update.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
+
+# ======================
+# CALLBACK BOTONES (ACK MÍNIMO)
+# ======================
+async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()  # desbloquea UI
+
+    data = query.data or ""
+    parts = data.split("|")
+    if len(parts) != 3 or parts[0] != "ACK":
+        await query.edit_message_text("❌ Callback inválido.")
+        return
+
+    id_alerta = parts[1].strip()
+    accion = parts[2].strip()  # RECIBIDO / EN_PROCESO / RENOVADO
+
+    user = query.from_user
+    user_name = f"@{user.username}" if user.username else (user.full_name or "Usuario")
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        # Seguridad: este botón SOLO debe funcionar si proviene del mensaje detalle correcto
+        msg_text = (query.message.text or "")
+        if f"ID_ALERTA: {id_alerta}" not in msg_text:
+            await query.answer("⚠️ Este botón no corresponde a este detalle.", show_alert=True)
+            return
+
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+        ws_ack = sh.worksheet(TAB_ACK)
+        ws_alert = sh.worksheet(TAB_ALERTAS)
+
+        # 1) Guardar ACK_ALERTAS por headers
+        headers_ack = [h.strip() for h in ws_ack.row_values(1)]
+        row_ack = {h: "" for h in headers_ack}
+        row_ack["ID_ALERTA"] = id_alerta
+        row_ack["ACCION"] = accion
+        row_ack["USER_NAME"] = user_name
+        row_ack["USER_ID"] = str(user.id)
+        row_ack["CHAT_ID"] = str(query.message.chat_id)
+        row_ack["TIMESTAMP"] = now_s
+
+        ws_ack.append_row([row_ack.get(h, "") for h in headers_ack], value_input_option="USER_ENTERED")
+
+        # 2) Actualizar ESTADO en ALERTAS_SCTR (por ID_ALERTA)
+        headers_alert = [h.strip() for h in ws_alert.row_values(1)]
+        if "ID_ALERTA" not in headers_alert or "ESTADO" not in headers_alert:
+            await query.edit_message_text("❌ ALERTAS_SCTR debe tener columnas ID_ALERTA y ESTADO.")
+            return
+
+        col_id = headers_alert.index("ID_ALERTA") + 1
+        col_estado = headers_alert.index("ESTADO") + 1
+
+        col_vals = ws_alert.col_values(col_id)
+        row_idx = None
+        for i, v in enumerate(col_vals[1:], start=2):
+            if str(v).strip() == id_alerta:
+                row_idx = i
+                break
+
+        if row_idx:
+            ws_alert.update_cell(row_idx, col_estado, accion)
+
+        # 3) Confirmación visual en el mensaje detalle
+        await query.edit_message_text(
+            f"✅ Registrado: {accion}\n"
+            f"ID_ALERTA: {id_alerta}\n"
+            f"Por: {user_name}\n"
+            f"Hora: {now_s}"
+        )
+
+    except Exception as e:
+        logging.exception("on_ack_callback error")
+        await query.edit_message_text(f"❌ Error procesando botón:\n{e}")
+
+
+# ======================
+# MAIN
+# ======================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta BOT_TOKEN en variables de entorno.")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("ping_sheet", ping_sheet))
     app.add_handler(CommandHandler("crear_tablero", crear_tablero))
     app.add_handler(CommandHandler("actualizar_tablero", actualizar_tablero))
     app.add_handler(CommandHandler("detalle", detalle))
+
+    app.add_handler(CallbackQueryHandler(on_ack_callback, pattern=r"^ACK\|"))
 
     print("Bot corriendo...")
     app.run_polling(close_loop=False)
@@ -331,6 +459,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
