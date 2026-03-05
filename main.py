@@ -9,6 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -142,14 +143,11 @@ def log_event(sh, event_type: str, payload: Dict[str, Any]) -> None:
     row["EVENT_TYPE"] = event_type
     row["TIMESTAMP"] = now_s()
 
-    # campos típicos
     for k in ("EMPRESA", "ID_ALERTA", "USER_ID", "USER_NAME", "DETAILS"):
         if k in headers and k in payload:
             row[k] = str(payload.get(k, ""))
 
-    # volcado extra en DETAILS si no existe columna
     if "DETAILS" in headers and not row.get("DETAILS"):
-        # Compacto, sin extender
         extras = {k: v for k, v in payload.items() if k not in ("EMPRESA", "ID_ALERTA", "USER_ID", "USER_NAME")}
         if extras:
             row["DETAILS"] = json.dumps(extras, ensure_ascii=False)
@@ -158,11 +156,33 @@ def log_event(sh, event_type: str, payload: Dict[str, Any]) -> None:
 
 
 # ======================
-# TABLERO (Paso 20)
+# TABLERO (estilo "panel" como imagen) - Paso 20 mejorado
 # ======================
+def _esc_html(s: str) -> str:
+    if s is None:
+        return ""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
 def build_tablero_text_from_alertas(rows: List[Dict[str, Any]]) -> str:
-    t = now_s()
-    valid = []
+    """
+    Devuelve HTML (ParseMode.HTML).
+    Estilo tipo panel:
+      📌 TABLERO SCTR
+      Actualizado: dd/mm/aaaa
+      🟥 CRÍTICOS...
+      🟧 ALERTA...
+      🟨 PRÓXIMOS...
+    """
+    t = datetime.now()
+    actualizado = t.strftime("%d/%m/%Y")
+
+    # Filtrar solo los que tienen NIVEL valido (<=15 días por diseño)
+    valid: List[Dict[str, Any]] = []
     for r in rows:
         nivel = str(r.get("NIVEL", "")).strip().upper()
         if nivel in ("CRITICO", "ALERTA", "PROXIMO"):
@@ -170,66 +190,67 @@ def build_tablero_text_from_alertas(rows: List[Dict[str, Any]]) -> str:
 
     order = {"CRITICO": 0, "ALERTA": 1, "PROXIMO": 2}
 
-    def k(r):
-        nivel = str(r.get("NIVEL", "")).strip().upper()
+    def _dias_int(r):
         ds = str(r.get("DIAS_RESTANTES", "999")).strip()
         try:
-            di = int(float(ds))
+            return int(float(ds))
         except Exception:
-            di = 999
-        emp = str(r.get("EMPRESA", "")).strip()
-        return (order.get(nivel, 9), di, emp)
+            return 999
 
-    valid.sort(key=k)
+    def _key(r):
+        nivel = str(r.get("NIVEL", "")).strip().upper()
+        emp = str(r.get("EMPRESA", "")).strip()
+        return (order.get(nivel, 9), _dias_int(r), emp)
+
+    valid.sort(key=_key)
 
     groups = {"CRITICO": [], "ALERTA": [], "PROXIMO": []}
     for r in valid:
         groups[str(r.get("NIVEL", "")).strip().upper()].append(r)
 
-    def badge(estado: str) -> str:
+    def badge(estado: str) -> Tuple[str, str]:
         e = (estado or "SIN_CONFIRMAR").strip().upper()
         if e == "RECIBIDO":
-            return "🟩 RECIBIDO"
+            return "🟩", "RECIBIDO"
         if e == "EN_PROCESO":
-            return "🟨 EN_PROCESO"
+            return "🟨", "EN_PROCESO"
         if e == "RENOVADO":
-            return "🟦 RENOVADO"
-        return "⬜ SIN_CONFIRMAR"
+            return "🟦", "RENOVADO"
+        return "⬜", "SIN_CONFIRMAR"
 
     def line(r):
-        emp = str(r.get("EMPRESA", "—")).strip() or "—"
-        ffin = str(r.get("FECHA_FIN", "—")).strip() or "—"
-        dias = str(r.get("DIAS_RESTANTES", "—")).strip() or "—"
-        est = str(r.get("ESTADO", "SIN_CONFIRMAR")).strip()
-        return f"• {emp} — {ffin} — {dias} días — {badge(est)}"
+        emp = _esc_html(str(r.get("EMPRESA", "—")).strip() or "—")
+        ffin = _esc_html(str(r.get("FECHA_FIN", "—")).strip() or "—")
+        dias = _esc_html(str(r.get("DIAS_RESTANTES", "—")).strip() or "—")
+        icon, st = badge(str(r.get("ESTADO", "SIN_CONFIRMAR")))
+        # Formato tipo imagen: EMPRESA — FECHA — X días — [estado]
+        return f"• <b>{emp}</b> — {ffin} — {dias} días — {icon} <b>{st}</b>"
 
-    parts = [
-        "📌 TABLERO SCTR",
-        f"Actualizado: {t}",
-        "",
-    ]
+    parts: List[str] = []
+    parts.append("📌 <b>TABLERO SCTR</b>")
+    parts.append(f"Actualizado: <b>{actualizado}</b>")
+    parts.append("")
 
     if groups["CRITICO"]:
-        parts.append("🚨 CRÍTICOS (0–3 días)")
-        parts += [line(r) for r in groups["CRITICO"]]
+        parts.append("🟥 <b>CRÍTICOS (0–3 días)</b>")
+        parts.extend([line(r) for r in groups["CRITICO"]])
         parts.append("")
 
     if groups["ALERTA"]:
-        parts.append("⚠️ ALERTA (4–7 días)")
-        parts += [line(r) for r in groups["ALERTA"]]
+        parts.append("🟧 <b>ALERTA (4–7 días)</b>")
+        parts.extend([line(r) for r in groups["ALERTA"]])
         parts.append("")
 
     if groups["PROXIMO"]:
-        parts.append("🟡 PRÓXIMOS (8–15 días)")
-        parts += [line(r) for r in groups["PROXIMO"]]
+        parts.append("🟨 <b>PRÓXIMOS (8–15 días)</b>")
+        parts.extend([line(r) for r in groups["PROXIMO"]])
         parts.append("")
 
     if not valid:
-        parts.append("✅ Sin alertas activas (0–15 días).")
+        parts.append("✅ <b>Sin alertas activas (0–15 días).</b>")
+        parts.append("")
 
-    parts.append("")
-    parts.append("✅ Confirma con: /detalle EMPRESA")
-    parts.append("🔄 Manual: /actualizar_tablero  |  🔁 Sync: /sync_alertas")
+    parts.append("<i>* Toma acción según prioridad *</i>")
     return "\n".join(parts).strip()
 
 
@@ -264,7 +285,9 @@ async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[
     await context.bot.edit_message_text(
         chat_id=int(chat_id),
         message_id=int(msg_id),
-        text=text
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
     )
     return (int(chat_id), int(msg_id))
 
@@ -476,14 +499,13 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# Callback ACK (Paso 12/13 + Mejora 1: bloqueo doble respuesta)
+# Callback ACK (bloqueo doble respuesta)
 # ======================
 async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
 
-    # Respuesta rápida a Telegram UI
     await query.answer()
 
     data = query.data or ""
@@ -500,7 +522,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ts = now_s()
 
     try:
-        # Seguridad: el botón SOLO debe funcionar si proviene del mensaje detalle correcto
         msg_text = (query.message.text or "")
         if f"ID_ALERTA: {id_alerta}" not in msg_text:
             await query.answer("⚠️ Este botón no corresponde a este detalle.", show_alert=True)
@@ -512,7 +533,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws_alert = sh.worksheet(TAB_ALERTAS)
         ws_resp = sh.worksheet(TAB_RESP)
 
-        # Obtener alerta
         alerts = ws_alert.get_all_records()
         alert_row = None
         for r in alerts:
@@ -526,13 +546,11 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         empresa = str(alert_row.get("EMPRESA", "")).strip()
         estado_actual = str(alert_row.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
 
-        # Mejora 1: bloqueo si ya fue atendida (evita doble respuesta)
         if estado_actual in ("RECIBIDO", "EN_PROCESO", "RENOVADO") and accion != estado_actual:
             confirmado_por = str(alert_row.get("CONFIRMADO_POR", "")).strip() or "otro usuario"
             await query.answer(f"⚠️ Ya está {estado_actual} ({confirmado_por}).", show_alert=True)
             return
 
-        # Validar autorización por RESPONSABLES_EMPRESA (ACTIVO=1)
         resp_rows = ws_resp.get_all_records()
         autorizado = False
         for rr in resp_rows:
@@ -546,7 +564,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"⛔ No estás autorizado para responder por {empresa}.", show_alert=True)
             return
 
-        # Guardar ACK_ALERTAS por headers
         headers_ack = _headers(ws_ack)
         row_ack = {h: "" for h in headers_ack}
         for k, v in {
@@ -562,7 +579,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row_ack[k] = v
         ws_ack.append_row([row_ack.get(h, "") for h in headers_ack], value_input_option="USER_ENTERED")
 
-        # Actualizar ALERTAS_SCTR
         headers_alert = _headers(ws_alert)
         if "ID_ALERTA" not in headers_alert or "ESTADO" not in headers_alert:
             await query.edit_message_text("❌ ALERTAS_SCTR debe tener ID_ALERTA y ESTADO.")
@@ -585,7 +601,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upd_if_exists("CONFIRMADO_AT", ts)
         upd_if_exists("UPDATED_AT", ts)
 
-        # Evento (Paso 18)
         log_event(sh, "ACK", {
             "EMPRESA": empresa,
             "ID_ALERTA": id_alerta,
@@ -594,7 +609,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "DETAILS": accion,
         })
 
-        # Confirmación visual
         await query.edit_message_text(
             f"✅ Registrado: {accion}\n"
             f"Empresa: {empresa}\n"
@@ -603,7 +617,6 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Hora: {ts}"
         )
 
-        # Refrescar tablero + bump
         await refresh_tablero(context)
         await bump_tablero(context, f"{empresa}: {accion}")
 
@@ -617,7 +630,7 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ======================
 # Paso 16: Sync manual desde SCTR_VIGENTE (fecha texto)
-# + Mejora 3: cierre automático si cambia FECHA_FIN
+# + cierre automático si cambia FECHA_FIN
 # ======================
 async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -639,7 +652,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"❌ Falta columna en ALERTAS_SCTR: {c}")
                 return
 
-        # Índice empresa->fila en ALERTAS_SCTR
         col_emp = headers_alert.index("EMPRESA") + 1
         emp_col_vals = ws_alert.col_values(col_emp)
         emp_to_rowidx: Dict[str, int] = {}
@@ -648,7 +660,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if vv:
                 emp_to_rowidx[vv] = i
 
-        # Map empresa->record y max_id
         alert_records = ws_alert.get_all_records()
         emp_to_record: Dict[str, Dict[str, Any]] = {}
         max_id = 0
@@ -661,7 +672,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # Columnas
         col_ida = headers_alert.index("ID_ALERTA") + 1
         col_ff = headers_alert.index("FECHA_FIN") + 1
         col_dias = headers_alert.index("DIAS_RESTANTES") + 1
@@ -670,7 +680,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         col_created = headers_alert.index("CREATED_AT") + 1
         col_updated = headers_alert.index("UPDATED_AT") + 1
 
-        # Opcionales
         col_conf_por = headers_alert.index("CONFIRMADO_POR") + 1 if "CONFIRMADO_POR" in headers_alert else None
         col_conf_at = headers_alert.index("CONFIRMADO_AT") + 1 if "CONFIRMADO_AT" in headers_alert else None
 
@@ -697,8 +706,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             dias = (dt_fin.date() - now_dt.date()).days
             nivel = calc_nivel(dias)
-
-            # Si >15 días, no genera/actualiza alerta visible (pero si existe ya, la dejamos como está)
             if nivel is None:
                 continue
 
@@ -709,7 +716,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 prev_fin = str(prev.get("FECHA_FIN", "")).strip()
                 prev_estado = str(prev.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
 
-                # Mejora 3: si FECHA_FIN cambió, auto-marcar RENOVADO (si no estaba ya)
                 if prev_fin and prev_fin != fin_txt and prev_estado != "RENOVADO":
                     ws_alert.update_cell(row_i, col_estado, "RENOVADO")
                     if col_conf_por:
@@ -723,7 +729,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "DETAILS": f"{prev_fin} -> {fin_txt}"
                     })
 
-                # actualizar valores
                 ws_alert.update_cell(row_i, col_ff, fin_txt)
                 ws_alert.update_cell(row_i, col_dias, str(dias))
                 ws_alert.update_cell(row_i, col_nivel, nivel)
@@ -755,7 +760,6 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "DETAILS": f"vence={fin_txt}, dias={dias}, nivel={nivel}"
                 })
 
-        # refrescar tablero + bump
         await refresh_tablero(context)
         await bump_tablero(context, f"Sync: +{created} / upd {updated} / auto-ren {auto_renov}")
 
@@ -772,8 +776,7 @@ async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# Mejora 2: /estado (resumen rápido)
-# Paso 22: /dashboard (métricas)
+# /estado + /dashboard
 # ======================
 def _calc_stats(alert_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len([r for r in alert_rows if str(r.get("EMPRESA", "")).strip()])
@@ -786,9 +789,7 @@ def _calc_stats(alert_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     pro = 0
     ren = 0
 
-    # tiempos confirmación (CREATED_AT -> CONFIRMADO_AT)
     deltas = []
-
     for r in alert_rows:
         nivel = str(r.get("NIVEL", "")).strip().upper()
         estado = str(r.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
@@ -816,8 +817,7 @@ def _calc_stats(alert_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     avg_confirm = None
     if deltas:
-        avg = sum(deltas) / len(deltas)
-        avg_confirm = avg
+        avg_confirm = sum(deltas) / len(deltas)
 
     return {
         "total": total,
@@ -859,10 +859,6 @@ async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error en /estado:\n{e}")
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Dashboard compacto en Telegram (Paso 22).
-    Si existe hoja DASHBOARD_SCTR, también la actualiza.
-    """
     try:
         client = get_gspread_client()
         sh = client.open_by_key(SHEET_ID)
@@ -886,11 +882,9 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(msg)
 
-        # Opcional: escribir a hoja DASHBOARD_SCTR si existe
         ws_dash = try_get_ws(sh, TAB_DASH)
         if ws_dash is not None:
             headers = _headers(ws_dash)
-            # Recomendado: KEY, VALUE, UPDATED_AT (pero si es otra estructura, no rompe)
             if "KEY" in headers and "VALUE" in headers:
                 def upsert(k: str, v: str):
                     c_key = _col(headers, "KEY")
@@ -927,11 +921,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # JOBS (Paso 17, 19, recordatorios)
 # ======================
 async def sync_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Paso 17: ejecuta sync automático sin comando.
-    """
     try:
-        # Job no tiene update, así que hacemos un sync similar al manual, pero sin mensajes.
         client = get_gspread_client()
         sh = client.open_by_key(SHEET_ID)
         ws_sctr = try_get_ws(sh, TAB_SCTR)
@@ -1046,7 +1036,6 @@ async def sync_job(context: ContextTypes.DEFAULT_TYPE):
                     "DETAILS": f"vence={fin_txt}, dias={dias}, nivel={nivel}"
                 })
 
-        # Actualiza tablero + bump si hubo cambios
         if created or updated or auto_ren:
             await refresh_tablero(context)
             await bump_tablero(context, f"AutoSync: +{created} / upd {updated} / auto-ren {auto_ren}")
@@ -1056,11 +1045,6 @@ async def sync_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Recordatorio automático (requiere columnas):
-      LAST_REMINDER_AT, REMINDER_COUNT
-    Envía recordatorio SOLO si hay CRITICO + SIN_CONFIRMAR.
-    """
     try:
         client = get_gspread_client()
         sh = client.open_by_key(SHEET_ID)
@@ -1101,7 +1085,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         now_dt = datetime.now()
         now_ts = now_dt.timestamp()
 
-        # si al menos 1 no fue recordada en la última hora, enviamos
         need_send = False
         for r in criticos:
             last_ts = 0.0
@@ -1131,7 +1114,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True
         )
 
-        # actualizar LAST_REMINDER_AT y REMINDER_COUNT
         ts = now_s()
         col_id = headers.index("ID_ALERTA") + 1
         col_last = headers.index("LAST_REMINDER_AT") + 1
@@ -1169,12 +1151,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def escalation_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Paso 19 (concepto implementado): escalamiento por tiempo sin confirmación.
-    Requiere columnas opcionales para no spamear:
-      ESCALATION_LEVEL, LAST_ESCALATION_AT
-    Si no existen, se omite el escalamiento.
-    """
     try:
         client = get_gspread_client()
         sh = client.open_by_key(SHEET_ID)
@@ -1207,9 +1183,7 @@ async def escalation_job(context: ContextTypes.DEFAULT_TYPE):
         rows = ws_alert.get_all_records()
         now_dt = datetime.now()
 
-        # índices
         col_id = headers.index("ID_ALERTA") + 1
-        col_emp = headers.index("EMPRESA") + 1 if "EMPRESA" in headers else None
         col_level = headers.index("ESCALATION_LEVEL") + 1
         col_last = headers.index("LAST_ESCALATION_AT") + 1
 
@@ -1259,7 +1233,6 @@ async def escalation_job(context: ContextTypes.DEFAULT_TYPE):
             if new_level <= level:
                 continue
 
-            # enviar escalamiento como reply al tablero (bump natural)
             text = (
                 f"🚨 ESCALAMIENTO SCTR (Nivel {new_level})\n\n"
                 f"Empresa: {emp}\n"
@@ -1275,7 +1248,6 @@ async def escalation_job(context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
-            # actualizar columnas
             ws_alert.update_cell(row_i, col_level, str(new_level))
             ws_alert.update_cell(row_i, col_last, now_s())
 
@@ -1298,7 +1270,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("ping_sheet", ping_sheet))
@@ -1306,27 +1277,18 @@ def main():
     app.add_handler(CommandHandler("actualizar_tablero", actualizar_tablero))
     app.add_handler(CommandHandler("detalle", detalle))
 
-    # Paso 16/17
     app.add_handler(CommandHandler("sync_alertas", sync_alertas))
 
-    # Mejora 2 y Paso 22
     app.add_handler(CommandHandler("estado", estado))
     app.add_handler(CommandHandler("dashboard", dashboard))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(on_ack_callback, pattern=r"^ACK\|"))
 
-    # Jobs (requiere python-telegram-bot[job-queue])
     if app.job_queue is None:
-        logging.warning("JobQueue no disponible. Instala: python-telegram-bot[job-queue]")
+        logging.warning('JobQueue no disponible. Instala: python-telegram-bot[job-queue]==21.6')
     else:
-        # Paso 17: autosync
         app.job_queue.run_repeating(sync_job, interval=SYNC_INTERVAL_SECONDS, first=60)
-
-        # Recordatorios (si columnas existen)
         app.job_queue.run_repeating(reminder_job, interval=60 * 60, first=90)
-
-        # Paso 19: escalamiento (si columnas existen)
         app.job_queue.run_repeating(escalation_job, interval=ESCALATION_CHECK_SECONDS, first=120)
 
     print("Bot corriendo...")
