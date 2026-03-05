@@ -1,7 +1,9 @@
 import os
 import json
+import uuid
 import logging
 from datetime import datetime
+from typing import Optional, Dict, Any, List, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -27,6 +29,19 @@ TAB_ALERTAS = "ALERTAS_SCTR"
 TAB_ACK = "ACK_ALERTAS"
 TAB_CONFIG = "CONFIG_ALERTAS"
 TAB_RESP = "RESPONSABLES_EMPRESA"
+TAB_SCTR = "SCTR_VIGENTE"        # Paso 16/17
+TAB_EVENTOS = "EVENTOS_SCTR"     # Paso 18 (si no existe, se omite)
+TAB_DASH = "DASHBOARD_SCTR"      # Paso 22 (si no existe, se omite)
+
+# Defaults anti-spam / escalamiento (si no existen columnas, se omite)
+REMINDER_MIN_SECONDS = 60 * 60
+SYNC_INTERVAL_SECONDS = 6 * 60 * 60
+ESCALATION_CHECK_SECONDS = 30 * 60
+ESC_LEVEL1_SECONDS = 6 * 60 * 60
+ESC_LEVEL2_SECONDS = 12 * 60 * 60
+ESC_LEVEL3_SECONDS = 24 * 60 * 60
+
+DT_FMT = "%Y-%m-%d %H:%M:%S"
 
 
 # ======================
@@ -47,13 +62,13 @@ def get_gspread_client() -> gspread.Client:
 def _ws(sh, name: str):
     return sh.worksheet(name)
 
-def _headers(ws):
+def _headers(ws) -> List[str]:
     return [h.strip() for h in ws.row_values(1)]
 
-def _col(headers, name: str) -> int:
+def _col(headers: List[str], name: str) -> int:
     return headers.index(name) + 1  # 1-based
 
-def _find_row_by_value(ws, col_idx: int, value: str):
+def _find_row_by_value(ws, col_idx: int, value: str) -> Optional[int]:
     vals = ws.col_values(col_idx)
     for i, v in enumerate(vals[1:], start=2):
         if str(v).strip() == str(value).strip():
@@ -62,117 +77,91 @@ def _find_row_by_value(ws, col_idx: int, value: str):
 
 
 # ======================
-# COMANDOS BÁSICOS
+# HELPERS FECHA / NIVEL
 # ======================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot de Alertas SCTR activo.")
+def now_s() -> str:
+    return datetime.now().strftime(DT_FMT)
 
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    name = f"@{u.username}" if u.username else (u.full_name or "Usuario")
-    await update.message.reply_text(f"👤 {name}\n🆔 USER_ID: {u.id}")
-
-async def ping_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def parse_dt(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
     try:
-        if not SHEET_ID:
-            await update.message.reply_text("❌ Falta SHEET_ID en Railway Variables.")
-            return
+        return datetime.strptime(s, DT_FMT)
+    except Exception:
+        return None
 
-        client = get_gspread_client()
-        sh = client.open_by_key(SHEET_ID)
+def parse_date_text(s: str) -> Optional[datetime]:
+    """
+    FECHA texto: soporta dd/mm/yyyy, dd-mm-yyyy, yyyy-mm-dd, yyyy/mm/dd
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
 
-        ws1 = sh.worksheet(TAB_ALERTAS)
-        ws2 = sh.worksheet(TAB_ACK)
-        ws3 = sh.worksheet(TAB_CONFIG)
-        ws4 = sh.worksheet(TAB_RESP)
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    return None
 
-        h1 = ws1.row_values(1)
-        h2 = ws2.row_values(1)
-        h3 = ws3.row_values(1)
-        h4 = ws4.row_values(1)
-
-        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        await update.message.reply_text(
-            "✅ Conexión OK con Google Sheets\n"
-            f"- {TAB_ALERTAS}: {len(h1)} columnas\n"
-            f"- {TAB_ACK}: {len(h2)} columnas\n"
-            f"- {TAB_CONFIG}: {len(h3)} columnas\n"
-            f"- {TAB_RESP}: {len(h4)} columnas\n"
-            f"Hora: {now_s}"
-        )
-    except Exception as e:
-        logging.exception("ping_sheet error")
-        await update.message.reply_text(f"❌ Error conectando a Sheets:\n{e}")
+def calc_nivel(dias: int) -> Optional[str]:
+    if dias <= 3:
+        return "CRITICO"
+    if 4 <= dias <= 7:
+        return "ALERTA"
+    if 8 <= dias <= 15:
+        return "PROXIMO"
+    return None
 
 
 # ======================
-# TABLERO: CREAR
+# EVENTOS (Paso 18) - si hoja no existe, se omite
 # ======================
-async def crear_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /crear_tablero
-    - Ejecutar dentro del grupo destino.
-    - Crea el mensaje del tablero y guarda el message_id en CONFIG_ALERTAS.
-    """
+def try_get_ws(sh, tab_name: str):
     try:
-        chat = update.effective_chat
-        if not chat:
-            return
-        chat_id = str(chat.id)
+        return sh.worksheet(tab_name)
+    except Exception:
+        return None
 
-        client = get_gspread_client()
-        sh = client.open_by_key(SHEET_ID)
-        ws_cfg = _ws(sh, TAB_CONFIG)
+def log_event(sh, event_type: str, payload: Dict[str, Any]) -> None:
+    """
+    Registra evento en EVENTOS_SCTR si existe.
+    Recomendado headers:
+      EVENT_ID, EVENT_TYPE, EMPRESA, ID_ALERTA, USER_ID, USER_NAME, DETAILS, TIMESTAMP
+    """
+    ws_ev = try_get_ws(sh, TAB_EVENTOS)
+    if ws_ev is None:
+        return
 
-        headers = _headers(ws_cfg)
-        for required in ("CHAT_ID_ALERTAS", "TABLERO_MESSAGE_ID", "ULTIMA_ACTUALIZACION"):
-            if required not in headers:
-                await update.message.reply_text(f"❌ CONFIG_ALERTAS no tiene columna: {required}")
-                return
+    headers = _headers(ws_ev)
+    row = {h: "" for h in headers}
 
-        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        tablero_text = (
-            "📌 TABLERO SCTR\n"
-            f"Actualizado: {now_s}\n\n"
-            "✅ Conexión lista.\n"
-            "Siguiente: cargaremos alertas y botones."
-        )
+    row["EVENT_ID"] = str(uuid.uuid4())
+    row["EVENT_TYPE"] = event_type
+    row["TIMESTAMP"] = now_s()
 
-        msg = await chat.send_message(tablero_text)
+    # campos típicos
+    for k in ("EMPRESA", "ID_ALERTA", "USER_ID", "USER_NAME", "DETAILS"):
+        if k in headers and k in payload:
+            row[k] = str(payload.get(k, ""))
 
-        c_chat = _col(headers, "CHAT_ID_ALERTAS")
-        c_mid = _col(headers, "TABLERO_MESSAGE_ID")
-        c_upd = _col(headers, "ULTIMA_ACTUALIZACION")
+    # volcado extra en DETAILS si no existe columna
+    if "DETAILS" in headers and not row.get("DETAILS"):
+        # Compacto, sin extender
+        extras = {k: v for k, v in payload.items() if k not in ("EMPRESA", "ID_ALERTA", "USER_ID", "USER_NAME")}
+        if extras:
+            row["DETAILS"] = json.dumps(extras, ensure_ascii=False)
 
-        row = _find_row_by_value(ws_cfg, c_chat, chat_id)
-        if row is None:
-            new_row = [""] * len(headers)
-            new_row[c_chat - 1] = chat_id
-            new_row[c_mid - 1] = str(msg.message_id)
-            new_row[c_upd - 1] = now_s
-            ws_cfg.append_row(new_row, value_input_option="USER_ENTERED")
-        else:
-            ws_cfg.update_cell(row, c_mid, str(msg.message_id))
-            ws_cfg.update_cell(row, c_upd, now_s)
-
-        await update.message.reply_text(
-            "✅ Tablero creado y registrado en CONFIG_ALERTAS.\n"
-            f"CHAT_ID_ALERTAS={chat_id}\n"
-            f"TABLERO_MESSAGE_ID={msg.message_id}\n\n"
-            "📌 Ahora ANCLA (PIN) ese mensaje en el grupo."
-        )
-
-    except Exception as e:
-        logging.exception("crear_tablero error")
-        await update.message.reply_text(f"❌ Error creando tablero:\n{e}")
+    ws_ev.append_row([row.get(h, "") for h in headers], value_input_option="USER_ENTERED")
 
 
 # ======================
-# TABLERO: CONSTRUIR TEXTO
+# TABLERO (Paso 20)
 # ======================
-def build_tablero_text_from_alertas(rows: list) -> str:
-    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+def build_tablero_text_from_alertas(rows: List[Dict[str, Any]]) -> str:
+    t = now_s()
     valid = []
     for r in rows:
         nivel = str(r.get("NIVEL", "")).strip().upper()
@@ -181,70 +170,73 @@ def build_tablero_text_from_alertas(rows: list) -> str:
 
     order = {"CRITICO": 0, "ALERTA": 1, "PROXIMO": 2}
 
-    def key_fn(r):
+    def k(r):
         nivel = str(r.get("NIVEL", "")).strip().upper()
-        dias_s = str(r.get("DIAS_RESTANTES", "999")).strip()
+        ds = str(r.get("DIAS_RESTANTES", "999")).strip()
         try:
-            dias = int(float(dias_s))
+            di = int(float(ds))
         except Exception:
-            dias = 999
+            di = 999
         emp = str(r.get("EMPRESA", "")).strip()
-        return (order.get(nivel, 9), dias, emp)
+        return (order.get(nivel, 9), di, emp)
 
-    valid.sort(key=key_fn)
+    valid.sort(key=k)
 
     groups = {"CRITICO": [], "ALERTA": [], "PROXIMO": []}
     for r in valid:
         groups[str(r.get("NIVEL", "")).strip().upper()].append(r)
 
-    title = f"📌 TABLERO SCTR\nActualizado: {now_s}\n\n"
-    parts = [title]
+    def badge(estado: str) -> str:
+        e = (estado or "SIN_CONFIRMAR").strip().upper()
+        if e == "RECIBIDO":
+            return "🟩 RECIBIDO"
+        if e == "EN_PROCESO":
+            return "🟨 EN_PROCESO"
+        if e == "RENOVADO":
+            return "🟦 RENOVADO"
+        return "⬜ SIN_CONFIRMAR"
 
-    def fmt_line(r):
+    def line(r):
         emp = str(r.get("EMPRESA", "—")).strip() or "—"
         ffin = str(r.get("FECHA_FIN", "—")).strip() or "—"
         dias = str(r.get("DIAS_RESTANTES", "—")).strip() or "—"
-        estado = str(r.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
+        est = str(r.get("ESTADO", "SIN_CONFIRMAR")).strip()
+        return f"• {emp} — {ffin} — {dias} días — {badge(est)}"
 
-        badge = "⬜ Sin confirmar"
-        if estado == "RECIBIDO":
-            badge = "✅ Recibido"
-        elif estado == "EN_PROCESO":
-            badge = "🟠 En proceso"
-        elif estado == "RENOVADO":
-            badge = "✅ Renovado"
-
-        return f"• {emp} — {ffin} — {dias} días — {badge}"
+    parts = [
+        "📌 TABLERO SCTR",
+        f"Actualizado: {t}",
+        "",
+    ]
 
     if groups["CRITICO"]:
-        parts.append("🔴 VENCEN 0–3 DÍAS")
-        parts += [fmt_line(r) for r in groups["CRITICO"]]
+        parts.append("🚨 CRÍTICOS (0–3 días)")
+        parts += [line(r) for r in groups["CRITICO"]]
         parts.append("")
 
     if groups["ALERTA"]:
-        parts.append("🟠 PRÓXIMOS 4–7 DÍAS")
-        parts += [fmt_line(r) for r in groups["ALERTA"]]
+        parts.append("⚠️ ALERTA (4–7 días)")
+        parts += [line(r) for r in groups["ALERTA"]]
         parts.append("")
 
     if groups["PROXIMO"]:
-        parts.append("🟡 PRÓXIMOS 8–15 DÍAS")
-        parts += [fmt_line(r) for r in groups["PROXIMO"]]
+        parts.append("🟡 PRÓXIMOS (8–15 días)")
+        parts += [line(r) for r in groups["PROXIMO"]]
         parts.append("")
 
     if not valid:
-        parts.append("No hay alertas activas en este momento.")
+        parts.append("✅ Sin alertas activas (0–15 días).")
 
-    parts.append("\n✅ Confirma con: /detalle EMPRESA")
-    parts.append("🔄 Actualiza manual: /actualizar_tablero")
+    parts.append("")
+    parts.append("✅ Confirma con: /detalle EMPRESA")
+    parts.append("🔄 Manual: /actualizar_tablero  |  🔁 Sync: /sync_alertas")
     return "\n".join(parts).strip()
 
 
-# ======================
-# TABLERO: REFRESH (EDITAR MENSAJE)
-# ======================
-async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE):
+async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[int], Optional[int]]:
     """
-    Regenera y edita el mensaje del tablero configurado en CONFIG_ALERTAS.
+    Edita el mensaje del tablero según CONFIG_ALERTAS.
+    Retorna (chat_id, msg_id) si existe.
     """
     client = get_gspread_client()
     sh = client.open_by_key(SHEET_ID)
@@ -253,21 +245,18 @@ async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE):
     ws_alert = sh.worksheet(TAB_ALERTAS)
 
     cfg_rows = ws_cfg.get_all_records()
-    if not cfg_rows:
-        return
-
     cfg = None
     for r in cfg_rows:
         if str(r.get("CHAT_ID_ALERTAS", "")).strip():
             cfg = r
             break
     if not cfg:
-        return
+        return (None, None)
 
     chat_id = str(cfg.get("CHAT_ID_ALERTAS", "")).strip()
     msg_id = str(cfg.get("TABLERO_MESSAGE_ID", "")).strip()
     if not chat_id or not msg_id:
-        return
+        return (None, None)
 
     rows = ws_alert.get_all_records()
     text = build_tablero_text_from_alertas(rows)
@@ -277,15 +266,12 @@ async def refresh_tablero(context: ContextTypes.DEFAULT_TYPE):
         message_id=int(msg_id),
         text=text
     )
+    return (int(chat_id), int(msg_id))
 
 
-# ======================
-# TABLERO: BUMP (REPLY CORTO AL TABLERO)
-# ======================
 async def bump_tablero(context: ContextTypes.DEFAULT_TYPE, reason: str = ""):
     """
-    Manda un mensaje corto como REPLY al tablero (bump).
-    No duplica el tablero; lo vuelve visible al final del chat.
+    PIN + bump por reply (sin duplicar tablero).
     """
     client = get_gspread_client()
     sh = client.open_by_key(SHEET_ID)
@@ -318,19 +304,106 @@ async def bump_tablero(context: ContextTypes.DEFAULT_TYPE, reason: str = ""):
 
 
 # ======================
-# TABLERO: ACTUALIZAR (COMANDO)
+# COMANDOS
 # ======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Bot de Alertas SCTR activo.")
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    name = f"@{u.username}" if u.username else (u.full_name or "Usuario")
+    await update.message.reply_text(f"👤 {name}\n🆔 USER_ID: {u.id}")
+
+async def ping_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not SHEET_ID:
+            await update.message.reply_text("❌ Falta SHEET_ID en Railway Variables.")
+            return
+
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+
+        tabs = [TAB_ALERTAS, TAB_ACK, TAB_CONFIG, TAB_RESP]
+        extra = [TAB_SCTR, TAB_EVENTOS, TAB_DASH]
+
+        info_lines = ["✅ Conexión OK con Google Sheets"]
+        for t in tabs + extra:
+            ws = try_get_ws(sh, t)
+            if ws is None:
+                info_lines.append(f"- {t}: (no existe)")
+            else:
+                info_lines.append(f"- {t}: {len(ws.row_values(1))} columnas")
+
+        info_lines.append(f"Hora: {now_s()}")
+        await update.message.reply_text("\n".join(info_lines))
+    except Exception as e:
+        logging.exception("ping_sheet error")
+        await update.message.reply_text(f"❌ Error conectando a Sheets:\n{e}")
+
+
+async def crear_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /crear_tablero
+    - Ejecutar dentro del grupo destino.
+    - Crea el mensaje del tablero y guarda message_id en CONFIG_ALERTAS.
+    """
+    try:
+        chat = update.effective_chat
+        if not chat:
+            return
+        chat_id = str(chat.id)
+
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+        ws_cfg = _ws(sh, TAB_CONFIG)
+
+        headers = _headers(ws_cfg)
+        for required in ("CHAT_ID_ALERTAS", "TABLERO_MESSAGE_ID", "ULTIMA_ACTUALIZACION"):
+            if required not in headers:
+                await update.message.reply_text(f"❌ CONFIG_ALERTAS no tiene columna: {required}")
+                return
+
+        msg = await chat.send_message("📌 TABLERO SCTR\nCreando tablero...")
+
+        c_chat = _col(headers, "CHAT_ID_ALERTAS")
+        c_mid = _col(headers, "TABLERO_MESSAGE_ID")
+        c_upd = _col(headers, "ULTIMA_ACTUALIZACION")
+
+        row = _find_row_by_value(ws_cfg, c_chat, chat_id)
+        if row is None:
+            new_row = [""] * len(headers)
+            new_row[c_chat - 1] = chat_id
+            new_row[c_mid - 1] = str(msg.message_id)
+            new_row[c_upd - 1] = now_s()
+            ws_cfg.append_row(new_row, value_input_option="USER_ENTERED")
+        else:
+            ws_cfg.update_cell(row, c_mid, str(msg.message_id))
+            ws_cfg.update_cell(row, c_upd, now_s())
+
+        # Render final
+        await refresh_tablero(context)
+
+        await update.message.reply_text(
+            "✅ Tablero creado y registrado en CONFIG_ALERTAS.\n"
+            f"CHAT_ID_ALERTAS={chat_id}\n"
+            f"TABLERO_MESSAGE_ID={msg.message_id}\n\n"
+            "📌 Ahora ANCLA (PIN) ese mensaje en el grupo."
+        )
+    except Exception as e:
+        logging.exception("crear_tablero error")
+        await update.message.reply_text(f"❌ Error creando tablero:\n{e}")
+
+
 async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await refresh_tablero(context)
         await bump_tablero(context, "Tablero actualizado (manual)")
 
-        # update ULTIMA_ACTUALIZACION
+        # actualizar ULTIMA_ACTUALIZACION
         client = get_gspread_client()
         sh = client.open_by_key(SHEET_ID)
         ws_cfg = sh.worksheet(TAB_CONFIG)
         headers = _headers(ws_cfg)
-
         if "CHAT_ID_ALERTAS" in headers and "ULTIMA_ACTUALIZACION" in headers:
             cfg_rows = ws_cfg.get_all_records()
             cfg = None
@@ -340,12 +413,9 @@ async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     break
             if cfg:
                 chat_id = str(cfg.get("CHAT_ID_ALERTAS", "")).strip()
-                c_chat = _col(headers, "CHAT_ID_ALERTAS")
-                c_upd = _col(headers, "ULTIMA_ACTUALIZACION")
-                row_i = _find_row_by_value(ws_cfg, c_chat, chat_id)
+                row_i = _find_row_by_value(ws_cfg, _col(headers, "CHAT_ID_ALERTAS"), chat_id)
                 if row_i:
-                    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    ws_cfg.update_cell(row_i, c_upd, now_s)
+                    ws_cfg.update_cell(row_i, _col(headers, "ULTIMA_ACTUALIZACION"), now_s())
 
         await update.message.reply_text("✅ Tablero actualizado.")
     except Exception as e:
@@ -354,7 +424,7 @@ async def actualizar_tablero(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ======================
-# DETALLE POR EMPRESA + BOTONES
+# /detalle + BOTONES
 # ======================
 async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -368,7 +438,6 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws = sh.worksheet(TAB_ALERTAS)
 
     rows = ws.get_all_records()
-
     alerta = None
     for r in rows:
         emp = str(r.get("EMPRESA", "")).strip().lower()
@@ -407,14 +476,15 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# CALLBACK BOTONES (ACK + AUTORIZACIÓN + REFRESH + BUMP)
+# Callback ACK (Paso 12/13 + Mejora 1: bloqueo doble respuesta)
 # ======================
 async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
 
-    await query.answer()  # desbloquea UI
+    # Respuesta rápida a Telegram UI
+    await query.answer()
 
     data = query.data or ""
     parts = data.split("|")
@@ -423,14 +493,14 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     id_alerta = parts[1].strip()
-    accion = parts[2].strip().upper()  # RECIBIDO / EN_PROCESO / RENOVADO
+    accion = parts[2].strip().upper()
 
     user = query.from_user
     user_name = f"@{user.username}" if user.username else (user.full_name or "Usuario")
-    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = now_s()
 
     try:
-        # Seguridad: botón solo funciona desde el mensaje detalle correcto
+        # Seguridad: el botón SOLO debe funcionar si proviene del mensaje detalle correcto
         msg_text = (query.message.text or "")
         if f"ID_ALERTA: {id_alerta}" not in msg_text:
             await query.answer("⚠️ Este botón no corresponde a este detalle.", show_alert=True)
@@ -442,21 +512,30 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws_alert = sh.worksheet(TAB_ALERTAS)
         ws_resp = sh.worksheet(TAB_RESP)
 
-        # 1) Obtener EMPRESA del ID_ALERTA
-        rows_alert = ws_alert.get_all_records()
-        empresa = None
-        for r in rows_alert:
+        # Obtener alerta
+        alerts = ws_alert.get_all_records()
+        alert_row = None
+        for r in alerts:
             if str(r.get("ID_ALERTA", "")).strip() == id_alerta:
-                empresa = str(r.get("EMPRESA", "")).strip()
+                alert_row = r
                 break
-        if not empresa:
-            await query.answer("⚠️ No se encontró la empresa de esta alerta.", show_alert=True)
+        if not alert_row:
+            await query.answer("⚠️ No se encontró la alerta.", show_alert=True)
             return
 
-        # 2) Validar autorización (RESPONSABLES_EMPRESA, ACTIVO=1)
-        rows_resp = ws_resp.get_all_records()
+        empresa = str(alert_row.get("EMPRESA", "")).strip()
+        estado_actual = str(alert_row.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
+
+        # Mejora 1: bloqueo si ya fue atendida (evita doble respuesta)
+        if estado_actual in ("RECIBIDO", "EN_PROCESO", "RENOVADO") and accion != estado_actual:
+            confirmado_por = str(alert_row.get("CONFIRMADO_POR", "")).strip() or "otro usuario"
+            await query.answer(f"⚠️ Ya está {estado_actual} ({confirmado_por}).", show_alert=True)
+            return
+
+        # Validar autorización por RESPONSABLES_EMPRESA (ACTIVO=1)
+        resp_rows = ws_resp.get_all_records()
         autorizado = False
-        for rr in rows_resp:
+        for rr in resp_rows:
             emp = str(rr.get("EMPRESA", "")).strip().lower()
             uid = str(rr.get("USER_ID", "")).strip()
             activo = str(rr.get("ACTIVO", "1")).strip()
@@ -467,32 +546,27 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"⛔ No estás autorizado para responder por {empresa}.", show_alert=True)
             return
 
-        # 3) Guardar ACK_ALERTAS por headers
-        headers_ack = [h.strip() for h in ws_ack.row_values(1)]
+        # Guardar ACK_ALERTAS por headers
+        headers_ack = _headers(ws_ack)
         row_ack = {h: "" for h in headers_ack}
-        if "ID_ALERTA" in headers_ack:
-            row_ack["ID_ALERTA"] = id_alerta
-        if "EMPRESA" in headers_ack:
-            row_ack["EMPRESA"] = empresa
-        if "ACCION" in headers_ack:
-            row_ack["ACCION"] = accion
-        if "USER_NAME" in headers_ack:
-            row_ack["USER_NAME"] = user_name
-        if "USER_ID" in headers_ack:
-            row_ack["USER_ID"] = str(user.id)
-        if "CHAT_ID" in headers_ack:
-            row_ack["CHAT_ID"] = str(query.message.chat_id)
-        if "TIMESTAMP" in headers_ack:
-            row_ack["TIMESTAMP"] = now_s
-
+        for k, v in {
+            "ID_ALERTA": id_alerta,
+            "EMPRESA": empresa,
+            "ACCION": accion,
+            "USER_NAME": user_name,
+            "USER_ID": str(user.id),
+            "CHAT_ID": str(query.message.chat_id),
+            "TIMESTAMP": ts
+        }.items():
+            if k in headers_ack:
+                row_ack[k] = v
         ws_ack.append_row([row_ack.get(h, "") for h in headers_ack], value_input_option="USER_ENTERED")
 
-        # 4) Actualizar ALERTAS_SCTR (ESTADO + confirmación)
-        headers_alert = [h.strip() for h in ws_alert.row_values(1)]
-        for must in ("ID_ALERTA", "ESTADO"):
-            if must not in headers_alert:
-                await query.edit_message_text(f"❌ ALERTAS_SCTR debe tener columna {must}.")
-                return
+        # Actualizar ALERTAS_SCTR
+        headers_alert = _headers(ws_alert)
+        if "ID_ALERTA" not in headers_alert or "ESTADO" not in headers_alert:
+            await query.edit_message_text("❌ ALERTAS_SCTR debe tener ID_ALERTA y ESTADO.")
+            return
 
         col_id = headers_alert.index("ID_ALERTA") + 1
         col_vals = ws_alert.col_values(col_id)
@@ -502,26 +576,34 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row_idx = i
                 break
 
-        if row_idx:
-            def upd_if_exists(colname: str, value: str):
-                if colname in headers_alert:
-                    ws_alert.update_cell(row_idx, headers_alert.index(colname) + 1, value)
+        def upd_if_exists(colname: str, value: str):
+            if colname in headers_alert and row_idx:
+                ws_alert.update_cell(row_idx, headers_alert.index(colname) + 1, value)
 
-            upd_if_exists("ESTADO", accion)
-            upd_if_exists("CONFIRMADO_POR", user_name)
-            upd_if_exists("CONFIRMADO_AT", now_s)
-            upd_if_exists("UPDATED_AT", now_s)
+        upd_if_exists("ESTADO", accion)
+        upd_if_exists("CONFIRMADO_POR", user_name)
+        upd_if_exists("CONFIRMADO_AT", ts)
+        upd_if_exists("UPDATED_AT", ts)
 
-        # 5) Confirmación visual en el mensaje detalle
+        # Evento (Paso 18)
+        log_event(sh, "ACK", {
+            "EMPRESA": empresa,
+            "ID_ALERTA": id_alerta,
+            "USER_ID": str(user.id),
+            "USER_NAME": user_name,
+            "DETAILS": accion,
+        })
+
+        # Confirmación visual
         await query.edit_message_text(
             f"✅ Registrado: {accion}\n"
             f"Empresa: {empresa}\n"
             f"ID_ALERTA: {id_alerta}\n"
             f"Por: {user_name}\n"
-            f"Hora: {now_s}"
+            f"Hora: {ts}"
         )
 
-        # 6) Actualizar tablero + bump
+        # Refrescar tablero + bump
         await refresh_tablero(context)
         await bump_tablero(context, f"{empresa}: {accion}")
 
@@ -534,27 +616,459 @@ async def on_ack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================
-# JOB RECORDATORIOS
+# Paso 16: Sync manual desde SCTR_VIGENTE (fecha texto)
+# + Mejora 3: cierre automático si cambia FECHA_FIN
 # ======================
-def _parse_dt(s: str) -> float:
+async def sync_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        return datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S").timestamp()
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+
+        ws_sctr = sh.worksheet(TAB_SCTR)
+        ws_alert = sh.worksheet(TAB_ALERTAS)
+
+        sctr_rows = ws_sctr.get_all_records()
+        if not sctr_rows:
+            await update.message.reply_text("⚠️ SCTR_VIGENTE está vacío.")
+            return
+
+        headers_alert = _headers(ws_alert)
+        required_alert = ["ID_ALERTA", "EMPRESA", "FECHA_FIN", "DIAS_RESTANTES", "NIVEL", "ESTADO", "CREATED_AT", "UPDATED_AT"]
+        for c in required_alert:
+            if c not in headers_alert:
+                await update.message.reply_text(f"❌ Falta columna en ALERTAS_SCTR: {c}")
+                return
+
+        # Índice empresa->fila en ALERTAS_SCTR
+        col_emp = headers_alert.index("EMPRESA") + 1
+        emp_col_vals = ws_alert.col_values(col_emp)
+        emp_to_rowidx: Dict[str, int] = {}
+        for i, v in enumerate(emp_col_vals[1:], start=2):
+            vv = str(v).strip().lower()
+            if vv:
+                emp_to_rowidx[vv] = i
+
+        # Map empresa->record y max_id
+        alert_records = ws_alert.get_all_records()
+        emp_to_record: Dict[str, Dict[str, Any]] = {}
+        max_id = 0
+        for r in alert_records:
+            emp = str(r.get("EMPRESA", "")).strip().lower()
+            if emp:
+                emp_to_record[emp] = r
+            try:
+                max_id = max(max_id, int(str(r.get("ID_ALERTA", "0")).strip() or "0"))
+            except Exception:
+                pass
+
+        # Columnas
+        col_ida = headers_alert.index("ID_ALERTA") + 1
+        col_ff = headers_alert.index("FECHA_FIN") + 1
+        col_dias = headers_alert.index("DIAS_RESTANTES") + 1
+        col_nivel = headers_alert.index("NIVEL") + 1
+        col_estado = headers_alert.index("ESTADO") + 1
+        col_created = headers_alert.index("CREATED_AT") + 1
+        col_updated = headers_alert.index("UPDATED_AT") + 1
+
+        # Opcionales
+        col_conf_por = headers_alert.index("CONFIRMADO_POR") + 1 if "CONFIRMADO_POR" in headers_alert else None
+        col_conf_at = headers_alert.index("CONFIRMADO_AT") + 1 if "CONFIRMADO_AT" in headers_alert else None
+
+        ts = now_s()
+        now_dt = datetime.now()
+
+        created = 0
+        updated = 0
+        skipped = 0
+        auto_renov = 0
+
+        for s in sctr_rows:
+            empresa = str(s.get("EMPRESA", "")).strip()
+            estado_sctr = str(s.get("ESTADO", "ACTIVO")).strip().upper()
+            fin_txt = str(s.get("FECHA_FIN", "")).strip()
+
+            if not empresa or estado_sctr != "ACTIVO":
+                continue
+
+            dt_fin = parse_date_text(fin_txt)
+            if not dt_fin:
+                skipped += 1
+                continue
+
+            dias = (dt_fin.date() - now_dt.date()).days
+            nivel = calc_nivel(dias)
+
+            # Si >15 días, no genera/actualiza alerta visible (pero si existe ya, la dejamos como está)
+            if nivel is None:
+                continue
+
+            emp_key = empresa.lower()
+            if emp_key in emp_to_rowidx:
+                row_i = emp_to_rowidx[emp_key]
+                prev = emp_to_record.get(emp_key, {})
+                prev_fin = str(prev.get("FECHA_FIN", "")).strip()
+                prev_estado = str(prev.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
+
+                # Mejora 3: si FECHA_FIN cambió, auto-marcar RENOVADO (si no estaba ya)
+                if prev_fin and prev_fin != fin_txt and prev_estado != "RENOVADO":
+                    ws_alert.update_cell(row_i, col_estado, "RENOVADO")
+                    if col_conf_por:
+                        ws_alert.update_cell(row_i, col_conf_por, "AUTO")
+                    if col_conf_at:
+                        ws_alert.update_cell(row_i, col_conf_at, ts)
+                    auto_renov += 1
+                    log_event(sh, "AUTO_RENOVADO", {
+                        "EMPRESA": empresa,
+                        "ID_ALERTA": str(prev.get("ID_ALERTA", "")),
+                        "DETAILS": f"{prev_fin} -> {fin_txt}"
+                    })
+
+                # actualizar valores
+                ws_alert.update_cell(row_i, col_ff, fin_txt)
+                ws_alert.update_cell(row_i, col_dias, str(dias))
+                ws_alert.update_cell(row_i, col_nivel, nivel)
+                ws_alert.update_cell(row_i, col_updated, ts)
+                updated += 1
+
+                log_event(sh, "ALERTA_ACTUALIZADA", {
+                    "EMPRESA": empresa,
+                    "ID_ALERTA": str(prev.get("ID_ALERTA", "")),
+                    "DETAILS": f"dias={dias}, nivel={nivel}"
+                })
+            else:
+                max_id += 1
+                new_row = [""] * len(headers_alert)
+                new_row[col_ida - 1] = str(max_id)
+                new_row[col_emp - 1] = empresa
+                new_row[col_ff - 1] = fin_txt
+                new_row[col_dias - 1] = str(dias)
+                new_row[col_nivel - 1] = nivel
+                new_row[col_estado - 1] = "SIN_CONFIRMAR"
+                new_row[col_created - 1] = ts
+                new_row[col_updated - 1] = ts
+                ws_alert.append_row(new_row, value_input_option="USER_ENTERED")
+                created += 1
+
+                log_event(sh, "ALERTA_CREADA", {
+                    "EMPRESA": empresa,
+                    "ID_ALERTA": str(max_id),
+                    "DETAILS": f"vence={fin_txt}, dias={dias}, nivel={nivel}"
+                })
+
+        # refrescar tablero + bump
+        await refresh_tablero(context)
+        await bump_tablero(context, f"Sync: +{created} / upd {updated} / auto-ren {auto_renov}")
+
+        await update.message.reply_text(
+            "✅ Sync listo.\n"
+            f"➕ Nuevas: {created}\n"
+            f"♻️ Actualizadas: {updated}\n"
+            f"🟦 Auto-renovadas (cambio FECHA_FIN): {auto_renov}\n"
+            f"⏭️ Omitidas (fecha inválida): {skipped}"
+        )
+    except Exception as e:
+        logging.exception("sync_alertas error")
+        await update.message.reply_text(f"❌ Error en sync_alertas:\n{e}")
+
+
+# ======================
+# Mejora 2: /estado (resumen rápido)
+# Paso 22: /dashboard (métricas)
+# ======================
+def _calc_stats(alert_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len([r for r in alert_rows if str(r.get("EMPRESA", "")).strip()])
+    crit = 0
+    aler = 0
+    prox = 0
+
+    sin = 0
+    rec = 0
+    pro = 0
+    ren = 0
+
+    # tiempos confirmación (CREATED_AT -> CONFIRMADO_AT)
+    deltas = []
+
+    for r in alert_rows:
+        nivel = str(r.get("NIVEL", "")).strip().upper()
+        estado = str(r.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
+
+        if nivel == "CRITICO":
+            crit += 1
+        elif nivel == "ALERTA":
+            aler += 1
+        elif nivel == "PROXIMO":
+            prox += 1
+
+        if estado == "RECIBIDO":
+            rec += 1
+        elif estado == "EN_PROCESO":
+            pro += 1
+        elif estado == "RENOVADO":
+            ren += 1
+        else:
+            sin += 1
+
+        c = parse_dt(str(r.get("CREATED_AT", "")).strip())
+        a = parse_dt(str(r.get("CONFIRMADO_AT", "")).strip())
+        if c and a and a >= c:
+            deltas.append((a - c).total_seconds())
+
+    avg_confirm = None
+    if deltas:
+        avg = sum(deltas) / len(deltas)
+        avg_confirm = avg
+
+    return {
+        "total": total,
+        "crit": crit,
+        "alerta": aler,
+        "prox": prox,
+        "sin": sin,
+        "rec": rec,
+        "pro": pro,
+        "ren": ren,
+        "avg_confirm_seconds": avg_confirm,
+    }
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+        ws_alert = sh.worksheet(TAB_ALERTAS)
+        stats = _calc_stats(ws_alert.get_all_records())
+
+        msg = (
+            "📊 ESTADO SCTR\n\n"
+            f"Empresas: {stats['total']}\n"
+            f"🚨 Críticas: {stats['crit']} | ⚠️ Alerta: {stats['alerta']} | 🟡 Próximos: {stats['prox']}\n"
+            f"⬜ Sin confirmar: {stats['sin']}\n"
+            f"🟩 Recibido: {stats['rec']} | 🟨 En proceso: {stats['pro']} | 🟦 Renovado: {stats['ren']}"
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        logging.exception("estado error")
+        await update.message.reply_text(f"❌ Error en /estado:\n{e}")
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Dashboard compacto en Telegram (Paso 22).
+    Si existe hoja DASHBOARD_SCTR, también la actualiza.
+    """
+    try:
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+        ws_alert = sh.worksheet(TAB_ALERTAS)
+        alert_rows = ws_alert.get_all_records()
+        stats = _calc_stats(alert_rows)
+
+        avg_confirm = "—"
+        if stats["avg_confirm_seconds"] is not None:
+            avg_confirm = _fmt_duration(stats["avg_confirm_seconds"])
+
+        msg = (
+            "📈 DASHBOARD SCTR\n\n"
+            f"Empresas monitoreadas: {stats['total']}\n"
+            f"Alertas activas (0–15 días): {stats['crit'] + stats['alerta'] + stats['prox']}\n"
+            f"🚨 Críticas: {stats['crit']}\n"
+            f"⬜ Pendientes (sin confirmar): {stats['sin']}\n"
+            f"🟩 Recibido: {stats['rec']} | 🟨 En proceso: {stats['pro']} | 🟦 Renovado: {stats['ren']}\n"
+            f"⏱ Promedio confirmación: {avg_confirm}\n"
+            f"Actualizado: {now_s()}"
+        )
+        await update.message.reply_text(msg)
+
+        # Opcional: escribir a hoja DASHBOARD_SCTR si existe
+        ws_dash = try_get_ws(sh, TAB_DASH)
+        if ws_dash is not None:
+            headers = _headers(ws_dash)
+            # Recomendado: KEY, VALUE, UPDATED_AT (pero si es otra estructura, no rompe)
+            if "KEY" in headers and "VALUE" in headers:
+                def upsert(k: str, v: str):
+                    c_key = _col(headers, "KEY")
+                    c_val = _col(headers, "VALUE")
+                    r = _find_row_by_value(ws_dash, c_key, k)
+                    if r is None:
+                        row = [""] * len(headers)
+                        row[c_key - 1] = k
+                        row[c_val - 1] = v
+                        if "UPDATED_AT" in headers:
+                            row[_col(headers, "UPDATED_AT") - 1] = now_s()
+                        ws_dash.append_row(row, value_input_option="USER_ENTERED")
+                    else:
+                        ws_dash.update_cell(r, c_val, v)
+                        if "UPDATED_AT" in headers:
+                            ws_dash.update_cell(r, _col(headers, "UPDATED_AT"), now_s())
+
+                upsert("empresas", str(stats["total"]))
+                upsert("criticas", str(stats["crit"]))
+                upsert("alerta", str(stats["alerta"]))
+                upsert("proximos", str(stats["prox"]))
+                upsert("sin_confirmar", str(stats["sin"]))
+                upsert("recibido", str(stats["rec"]))
+                upsert("en_proceso", str(stats["pro"]))
+                upsert("renovado", str(stats["ren"]))
+                upsert("prom_confirmacion", avg_confirm)
+
+    except Exception as e:
+        logging.exception("dashboard error")
+        await update.message.reply_text(f"❌ Error en /dashboard:\n{e}")
+
+
+# ======================
+# JOBS (Paso 17, 19, recordatorios)
+# ======================
+async def sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Paso 17: ejecuta sync automático sin comando.
+    """
+    try:
+        # Job no tiene update, así que hacemos un sync similar al manual, pero sin mensajes.
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+        ws_sctr = try_get_ws(sh, TAB_SCTR)
+        ws_alert = try_get_ws(sh, TAB_ALERTAS)
+        if ws_sctr is None or ws_alert is None:
+            return
+
+        sctr_rows = ws_sctr.get_all_records()
+        if not sctr_rows:
+            return
+
+        headers_alert = _headers(ws_alert)
+        required_alert = ["ID_ALERTA", "EMPRESA", "FECHA_FIN", "DIAS_RESTANTES", "NIVEL", "ESTADO", "CREATED_AT", "UPDATED_AT"]
+        if any(c not in headers_alert for c in required_alert):
+            return
+
+        col_emp = headers_alert.index("EMPRESA") + 1
+        emp_col_vals = ws_alert.col_values(col_emp)
+        emp_to_rowidx = {}
+        for i, v in enumerate(emp_col_vals[1:], start=2):
+            vv = str(v).strip().lower()
+            if vv:
+                emp_to_rowidx[vv] = i
+
+        alert_records = ws_alert.get_all_records()
+        emp_to_record = {}
+        max_id = 0
+        for r in alert_records:
+            emp = str(r.get("EMPRESA", "")).strip().lower()
+            if emp:
+                emp_to_record[emp] = r
+            try:
+                max_id = max(max_id, int(str(r.get("ID_ALERTA", "0")).strip() or "0"))
+            except Exception:
+                pass
+
+        col_ida = headers_alert.index("ID_ALERTA") + 1
+        col_ff = headers_alert.index("FECHA_FIN") + 1
+        col_dias = headers_alert.index("DIAS_RESTANTES") + 1
+        col_nivel = headers_alert.index("NIVEL") + 1
+        col_estado = headers_alert.index("ESTADO") + 1
+        col_created = headers_alert.index("CREATED_AT") + 1
+        col_updated = headers_alert.index("UPDATED_AT") + 1
+
+        col_conf_por = headers_alert.index("CONFIRMADO_POR") + 1 if "CONFIRMADO_POR" in headers_alert else None
+        col_conf_at = headers_alert.index("CONFIRMADO_AT") + 1 if "CONFIRMADO_AT" in headers_alert else None
+
+        ts = now_s()
+        nd = datetime.now()
+
+        created = 0
+        updated = 0
+        auto_ren = 0
+
+        for s in sctr_rows:
+            empresa = str(s.get("EMPRESA", "")).strip()
+            estado_sctr = str(s.get("ESTADO", "ACTIVO")).strip().upper()
+            fin_txt = str(s.get("FECHA_FIN", "")).strip()
+            if not empresa or estado_sctr != "ACTIVO":
+                continue
+
+            dt_fin = parse_date_text(fin_txt)
+            if not dt_fin:
+                continue
+
+            dias = (dt_fin.date() - nd.date()).days
+            nivel = calc_nivel(dias)
+            if nivel is None:
+                continue
+
+            emp_key = empresa.lower()
+            if emp_key in emp_to_rowidx:
+                row_i = emp_to_rowidx[emp_key]
+                prev = emp_to_record.get(emp_key, {})
+                prev_fin = str(prev.get("FECHA_FIN", "")).strip()
+                prev_estado = str(prev.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
+
+                if prev_fin and prev_fin != fin_txt and prev_estado != "RENOVADO":
+                    ws_alert.update_cell(row_i, col_estado, "RENOVADO")
+                    if col_conf_por:
+                        ws_alert.update_cell(row_i, col_conf_por, "AUTO")
+                    if col_conf_at:
+                        ws_alert.update_cell(row_i, col_conf_at, ts)
+                    auto_ren += 1
+                    log_event(sh, "AUTO_RENOVADO", {
+                        "EMPRESA": empresa,
+                        "ID_ALERTA": str(prev.get("ID_ALERTA", "")),
+                        "DETAILS": f"{prev_fin} -> {fin_txt}"
+                    })
+
+                ws_alert.update_cell(row_i, col_ff, fin_txt)
+                ws_alert.update_cell(row_i, col_dias, str(dias))
+                ws_alert.update_cell(row_i, col_nivel, nivel)
+                ws_alert.update_cell(row_i, col_updated, ts)
+                updated += 1
+            else:
+                max_id += 1
+                new_row = [""] * len(headers_alert)
+                new_row[col_ida - 1] = str(max_id)
+                new_row[col_emp - 1] = empresa
+                new_row[col_ff - 1] = fin_txt
+                new_row[col_dias - 1] = str(dias)
+                new_row[col_nivel - 1] = nivel
+                new_row[col_estado - 1] = "SIN_CONFIRMAR"
+                new_row[col_created - 1] = ts
+                new_row[col_updated - 1] = ts
+                ws_alert.append_row(new_row, value_input_option="USER_ENTERED")
+                created += 1
+                log_event(sh, "ALERTA_CREADA", {
+                    "EMPRESA": empresa,
+                    "ID_ALERTA": str(max_id),
+                    "DETAILS": f"vence={fin_txt}, dias={dias}, nivel={nivel}"
+                })
+
+        # Actualiza tablero + bump si hubo cambios
+        if created or updated or auto_ren:
+            await refresh_tablero(context)
+            await bump_tablero(context, f"AutoSync: +{created} / upd {updated} / auto-ren {auto_ren}")
+
     except Exception:
-        return 0.0
+        logging.exception("sync_job error")
+
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Se ejecuta cada 60 min.
-    Envía recordatorio SOLO si hay CRITICO + SIN_CONFIRMAR.
-    Requiere columnas en ALERTAS_SCTR:
+    Recordatorio automático (requiere columnas):
       LAST_REMINDER_AT, REMINDER_COUNT
+    Envía recordatorio SOLO si hay CRITICO + SIN_CONFIRMAR.
     """
     try:
         client = get_gspread_client()
         sh = client.open_by_key(SHEET_ID)
 
-        ws_cfg = sh.worksheet(TAB_CONFIG)
-        ws_alert = sh.worksheet(TAB_ALERTAS)
+        ws_cfg = try_get_ws(sh, TAB_CONFIG)
+        ws_alert = try_get_ws(sh, TAB_ALERTAS)
+        if ws_cfg is None or ws_alert is None:
+            return
 
         cfg_rows = ws_cfg.get_all_records()
         cfg = None
@@ -570,6 +1084,10 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         if not chat_id or not msg_id:
             return
 
+        headers = _headers(ws_alert)
+        if "LAST_REMINDER_AT" not in headers or "REMINDER_COUNT" not in headers or "ID_ALERTA" not in headers:
+            return
+
         rows = ws_alert.get_all_records()
         criticos = []
         for r in rows:
@@ -580,40 +1098,41 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         if not criticos:
             return
 
-        headers = _headers(ws_alert)
-        if "LAST_REMINDER_AT" not in headers or "REMINDER_COUNT" not in headers or "ID_ALERTA" not in headers:
-            return
+        now_dt = datetime.now()
+        now_ts = now_dt.timestamp()
 
-        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        now_ts = datetime.now().timestamp()
-        one_hour = 60 * 60
-
+        # si al menos 1 no fue recordada en la última hora, enviamos
         need_send = False
         for r in criticos:
+            last_ts = 0.0
             last = str(r.get("LAST_REMINDER_AT", "")).strip()
-            last_ts = _parse_dt(last)
-            if (now_ts - last_ts) >= one_hour:
+            ld = parse_dt(last)
+            if ld:
+                last_ts = ld.timestamp()
+            if (now_ts - last_ts) >= REMINDER_MIN_SECONDS:
                 need_send = True
                 break
         if not need_send:
             return
 
-        lines = ["⚠️ *RECORDATORIO SCTR CRÍTICO*", "Empresas sin confirmar:", ""]
+        lines = ["⚠️ RECORDATORIO SCTR CRÍTICO", "Empresas sin confirmar:", ""]
         for r in criticos:
             emp = str(r.get("EMPRESA", "—")).strip() or "—"
             ffin = str(r.get("FECHA_FIN", "—")).strip() or "—"
             dias = str(r.get("DIAS_RESTANTES", "—")).strip() or "—"
-            lines.append(f"• *{emp}* — {ffin} — *{dias} días*")
-        lines.append("\n✅ Confirma con: `/detalle EMPRESA`")
+            lines.append(f"• {emp} — {ffin} — {dias} días — ⬜ SIN_CONFIRMAR")
+        lines.append("")
+        lines.append("✅ Confirma con: /detalle EMPRESA")
 
         await context.bot.send_message(
             chat_id=int(chat_id),
             text="\n".join(lines),
-            parse_mode="Markdown",
             reply_to_message_id=int(msg_id),
             disable_web_page_preview=True
         )
 
+        # actualizar LAST_REMINDER_AT y REMINDER_COUNT
+        ts = now_s()
         col_id = headers.index("ID_ALERTA") + 1
         col_last = headers.index("LAST_REMINDER_AT") + 1
         col_cnt = headers.index("REMINDER_COUNT") + 1
@@ -636,13 +1155,138 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 cur = 0
 
-            ws_alert.update_cell(row_i, col_last, now_s)
+            ws_alert.update_cell(row_i, col_last, ts)
             ws_alert.update_cell(row_i, col_cnt, str(cur + 1))
 
-        # bump extra opcional (ya hay reply, pero lo dejamos apagado para evitar spam)
+            log_event(sh, "RECORDATORIO", {
+                "EMPRESA": str(r.get("EMPRESA", "")).strip(),
+                "ID_ALERTA": ida,
+                "DETAILS": "CRITICO SIN_CONFIRMAR"
+            })
 
     except Exception:
         logging.exception("reminder_job error")
+
+
+async def escalation_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Paso 19 (concepto implementado): escalamiento por tiempo sin confirmación.
+    Requiere columnas opcionales para no spamear:
+      ESCALATION_LEVEL, LAST_ESCALATION_AT
+    Si no existen, se omite el escalamiento.
+    """
+    try:
+        client = get_gspread_client()
+        sh = client.open_by_key(SHEET_ID)
+
+        ws_cfg = try_get_ws(sh, TAB_CONFIG)
+        ws_alert = try_get_ws(sh, TAB_ALERTAS)
+        if ws_cfg is None or ws_alert is None:
+            return
+
+        cfg_rows = ws_cfg.get_all_records()
+        cfg = None
+        for r in cfg_rows:
+            if str(r.get("CHAT_ID_ALERTAS", "")).strip():
+                cfg = r
+                break
+        if not cfg:
+            return
+
+        chat_id = str(cfg.get("CHAT_ID_ALERTAS", "")).strip()
+        msg_id = str(cfg.get("TABLERO_MESSAGE_ID", "")).strip()
+        if not chat_id or not msg_id:
+            return
+
+        headers = _headers(ws_alert)
+        if "ESCALATION_LEVEL" not in headers or "LAST_ESCALATION_AT" not in headers:
+            return
+        if "CREATED_AT" not in headers or "ESTADO" not in headers or "NIVEL" not in headers or "ID_ALERTA" not in headers:
+            return
+
+        rows = ws_alert.get_all_records()
+        now_dt = datetime.now()
+
+        # índices
+        col_id = headers.index("ID_ALERTA") + 1
+        col_emp = headers.index("EMPRESA") + 1 if "EMPRESA" in headers else None
+        col_level = headers.index("ESCALATION_LEVEL") + 1
+        col_last = headers.index("LAST_ESCALATION_AT") + 1
+
+        id_col_vals = ws_alert.col_values(col_id)
+        id_to_row = {}
+        for i, v in enumerate(id_col_vals[1:], start=2):
+            vv = str(v).strip()
+            if vv:
+                id_to_row[vv] = i
+
+        for r in rows:
+            nivel = str(r.get("NIVEL", "")).strip().upper()
+            estado = str(r.get("ESTADO", "SIN_CONFIRMAR")).strip().upper()
+            if nivel != "CRITICO" or estado != "SIN_CONFIRMAR":
+                continue
+
+            created = parse_dt(str(r.get("CREATED_AT", "")).strip())
+            if not created:
+                continue
+
+            ida = str(r.get("ID_ALERTA", "")).strip()
+            if not ida or ida not in id_to_row:
+                continue
+
+            row_i = id_to_row[ida]
+            emp = str(r.get("EMPRESA", "—")).strip() or "—"
+
+            try:
+                level = int(str(r.get("ESCALATION_LEVEL", "0")).strip() or "0")
+            except Exception:
+                level = 0
+
+            last_es = parse_dt(str(r.get("LAST_ESCALATION_AT", "")).strip())
+            if last_es and (now_dt - last_es).total_seconds() < ESCALATION_CHECK_SECONDS:
+                continue
+
+            age = (now_dt - created).total_seconds()
+            new_level = level
+
+            if age >= ESC_LEVEL3_SECONDS:
+                new_level = max(new_level, 3)
+            elif age >= ESC_LEVEL2_SECONDS:
+                new_level = max(new_level, 2)
+            elif age >= ESC_LEVEL1_SECONDS:
+                new_level = max(new_level, 1)
+
+            if new_level <= level:
+                continue
+
+            # enviar escalamiento como reply al tablero (bump natural)
+            text = (
+                f"🚨 ESCALAMIENTO SCTR (Nivel {new_level})\n\n"
+                f"Empresa: {emp}\n"
+                f"Estado: ⬜ SIN_CONFIRMAR\n"
+                f"Tiempo sin confirmación: {_fmt_duration(age)}\n\n"
+                "✅ Confirma con: /detalle EMPRESA"
+            )
+
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_to_message_id=int(msg_id),
+                disable_web_page_preview=True
+            )
+
+            # actualizar columnas
+            ws_alert.update_cell(row_i, col_level, str(new_level))
+            ws_alert.update_cell(row_i, col_last, now_s())
+
+            log_event(sh, "ESCALAMIENTO", {
+                "EMPRESA": emp,
+                "ID_ALERTA": ida,
+                "DETAILS": f"nivel={new_level}, age={int(age)}s"
+            })
+
+    except Exception:
+        logging.exception("escalation_job error")
 
 
 # ======================
@@ -654,17 +1298,36 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("ping_sheet", ping_sheet))
     app.add_handler(CommandHandler("crear_tablero", crear_tablero))
     app.add_handler(CommandHandler("actualizar_tablero", actualizar_tablero))
     app.add_handler(CommandHandler("detalle", detalle))
+
+    # Paso 16/17
+    app.add_handler(CommandHandler("sync_alertas", sync_alertas))
+
+    # Mejora 2 y Paso 22
+    app.add_handler(CommandHandler("estado", estado))
+    app.add_handler(CommandHandler("dashboard", dashboard))
+
+    # Callbacks
     app.add_handler(CallbackQueryHandler(on_ack_callback, pattern=r"^ACK\|"))
 
-    # Job: recordatorio cada 60 minutos (primera ejecución a los 60s para prueba)
-    app.job_queue.run_repeating(reminder_job, interval=60 * 60, first=60)
+    # Jobs (requiere python-telegram-bot[job-queue])
+    if app.job_queue is None:
+        logging.warning("JobQueue no disponible. Instala: python-telegram-bot[job-queue]")
+    else:
+        # Paso 17: autosync
+        app.job_queue.run_repeating(sync_job, interval=SYNC_INTERVAL_SECONDS, first=60)
+
+        # Recordatorios (si columnas existen)
+        app.job_queue.run_repeating(reminder_job, interval=60 * 60, first=90)
+
+        # Paso 19: escalamiento (si columnas existen)
+        app.job_queue.run_repeating(escalation_job, interval=ESCALATION_CHECK_SECONDS, first=120)
 
     print("Bot corriendo...")
     app.run_polling(close_loop=False)
